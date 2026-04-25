@@ -98,20 +98,77 @@ def _lib_suffix(kind: str) -> str:
     return ".so"
 
 
-def _compile(src: str, lib_path: Path, src_path: Path) -> None:
+def _compile(src: str, lib_path: Path, src_path: Path,
+             extra_flags: list[str] | None = None) -> None:
     compiler, kind = _find_compiler()
     src_path.write_text(src, encoding="utf-8")
+    extra = extra_flags or []
 
     if kind == "msvc":
-        # MSVC writes the .dll to the current directory; redirect via /Fe
-        cmd = [compiler] + _compile_flags(kind) + [str(src_path), f"/Fe:{lib_path}"]
+        cmd = [compiler] + _compile_flags(kind) + extra + [str(src_path), f"/Fe:{lib_path}"]
     else:
-        cmd = [compiler] + _compile_flags(kind) + [str(src_path), "-o", str(lib_path)]
+        cmd = [compiler] + _compile_flags(kind) + extra + [str(src_path), "-o", str(lib_path)]
 
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(_CACHE_DIR))
     if r.returncode != 0:
         stderr = r.stderr.strip() or r.stdout.strip()
         raise CompilationError(f"Compilation failed:\n\n{stderr}")
+
+
+# ---------------------------------------------------------------------------
+# Armadillo detection (result cached after first call)
+# ---------------------------------------------------------------------------
+_arma_flags: 'tuple[list[str], list[str]] | None' = None  # (cflags, ldflags)
+
+
+def _find_armadillo() -> tuple[list[str], list[str]]:
+    global _arma_flags
+    if _arma_flags is not None:
+        return _arma_flags
+
+    # Try pkg-config first (works on Linux, macOS with brew's pkg-config)
+    pkg = shutil.which("pkg-config")
+    if pkg:
+        r = subprocess.run(
+            [pkg, "--cflags", "--libs", "armadillo"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            parts = r.stdout.split()
+            cflags  = [p for p in parts if p.startswith("-I")]
+            ldflags = [p for p in parts if not p.startswith("-I")]
+            _arma_flags = (cflags, ldflags)
+            return _arma_flags
+
+    # Fall back to common install paths
+    candidates = [
+        ("/opt/homebrew/include", "/opt/homebrew/lib"),   # macOS Apple Silicon brew
+        ("/usr/local/include",    "/usr/local/lib"),       # macOS Intel brew / manual
+        ("/usr/include",          "/usr/lib"),             # Linux system
+        ("/usr/include/armadillo_bits/..", "/usr/lib"),    # some distros
+    ]
+    for inc, lib in candidates:
+        if (Path(inc) / "armadillo").exists():
+            _arma_flags = ([f"-I{inc}"], [f"-L{lib}", "-larmadillo"])
+            return _arma_flags
+
+    raise RuntimeError(
+        "Armadillo not found. Install it first:\n"
+        "  macOS:  brew install armadillo\n"
+        "  Ubuntu: sudo apt install libarmadillo-dev\n"
+        "  Fedora: sudo dnf install armadillo-devel\n"
+        "Then restart Python."
+    )
+
+
+def _needs_armadillo(code: str, funcs: list) -> bool:
+    if "arma::" in code:
+        return True
+    return any(
+        ptype in ("avec", "amat")
+        for _, _, params in funcs
+        for ptype, _ in params
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +178,8 @@ _TYPE_PAT = (
     r'(?:'
     r'(?:std::)?vector\s*<\s*double\s*>'
     r'|(?:std::)?vector\s*<\s*int\s*>'
+    r'|arma::mat'
+    r'|arma::vec'
     r'|double|float|int|long|size_t'
     r')'
 )
@@ -132,13 +191,18 @@ def _norm_type(t: str) -> str:
         return 'vec'
     if re.search(r'vector\s*<\s*int\s*>', t):
         return 'ivec'
+    if t == 'arma::vec':
+        return 'avec'
+    if t == 'arma::mat':
+        return 'amat'
     if t in ('double', 'float'):
         return 'double'
     if t in ('int', 'long', 'size_t'):
         return 'int'
     raise ValueError(
         f"Unsupported type {t!r}. "
-        "Supported: int, double, std::vector<double>, std::vector<int>."
+        "Supported: int, double, std::vector<double>, std::vector<int>, "
+        "arma::vec, arma::mat."
     )
 
 
@@ -208,6 +272,23 @@ def _gen_wrapper(ret: str, name: str, params: list[tuple[str, str]]) -> str:
                 f'std::vector<int> {pname}({pname}_data, {pname}_data + {pname}_len);'
             )
             call_args.append(pname)
+        elif ptype == 'avec':
+            # arma::vec shares the buffer directly (no copy, faster)
+            c_params += [f'double* {pname}_data', f'int {pname}_len']
+            setup.append(
+                f'arma::vec {pname}({pname}_data, (arma::uword){pname}_len, false, true);'
+            )
+            call_args.append(pname)
+        elif ptype == 'amat':
+            # numpy is row-major; Armadillo is col-major.
+            # Construct as (cols×rows) then transpose → correct (rows×cols) matrix.
+            c_params += [f'double* {pname}_data', f'int {pname}_rows', f'int {pname}_cols']
+            setup.append(
+                f'arma::mat {pname}('
+                f'arma::mat({pname}_data, (arma::uword){pname}_cols, '
+                f'(arma::uword){pname}_rows, false, true).t());'
+            )
+            call_args.append(pname)
 
     call = f'{name}({", ".join(call_args)})'
     if ret == 'vec':
@@ -215,6 +296,23 @@ def _gen_wrapper(ret: str, name: str, params: list[tuple[str, str]]) -> str:
             f'auto __r = {call};\n'
             f'            *__n_out = (int)__r.size();\n'
             f'            for (int __i = 0; __i < *__n_out; __i++) __out[__i] = __r[__i];'
+        )
+    elif ret == 'avec':
+        # arma::vec — elements stored contiguously, just memcpy via loop
+        store = (
+            f'auto __r = {call};\n'
+            f'            *__n_out = (int)__r.n_elem;\n'
+            f'            std::copy(__r.memptr(), __r.memptr() + __r.n_elem, __out);'
+        )
+    elif ret == 'amat':
+        # arma::mat is col-major internally; copy out in row-major order for numpy
+        store = (
+            f'auto __r = {call};\n'
+            f'            *__n_out = (int)(__r.n_rows * __r.n_cols);\n'
+            f'            int __idx = 0;\n'
+            f'            for (arma::uword __i = 0; __i < __r.n_rows; __i++)\n'
+            f'                for (arma::uword __j = 0; __j < __r.n_cols; __j++)\n'
+            f'                    __out[__idx++] = __r(__i, __j);'
         )
     else:
         store = f'__out[0] = (double)({call});\n            *__n_out = 1;'
@@ -235,8 +333,13 @@ def _gen_wrapper(ret: str, name: str, params: list[tuple[str, str]]) -> str:
     )
 
 
-def _build_source(user_code: str, funcs: list) -> str:
-    includes = _DEFAULT_INCLUDES if '#include' not in user_code else ''
+def _build_source(user_code: str, funcs: list, use_arma: bool = False) -> str:
+    if '#include' in user_code:
+        includes = ''
+    else:
+        includes = _DEFAULT_INCLUDES
+        if use_arma and '#include <armadillo>' not in user_code:
+            includes += '#include <armadillo>\n'
     wrappers = '\n'.join(_gen_wrapper(r, n, p) for r, n, p in funcs)
     return _EXPORT_MACRO + '\n' + includes + '\n' + user_code + '\n\n' + wrappers
 
@@ -244,13 +347,14 @@ def _build_source(user_code: str, funcs: list) -> str:
 # ---------------------------------------------------------------------------
 # Compile, load, cache
 # ---------------------------------------------------------------------------
-def _load_and_cache(key: str, src: str) -> ctypes.CDLL:
+def _load_and_cache(key: str, src: str,
+                    extra_flags: list[str] | None = None) -> ctypes.CDLL:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     _, kind = _find_compiler()
     lib_path = _CACHE_DIR / f'{key}{_lib_suffix(kind)}'
     src_path = _CACHE_DIR / f'{key}.cpp'
     if not lib_path.exists():
-        _compile(src, lib_path, src_path)
+        _compile(src, lib_path, src_path, extra_flags)
     lib = ctypes.CDLL(str(lib_path))
     _lib_cache[key] = lib
     return lib
@@ -273,10 +377,13 @@ def _make_callable(
             argtypes.append(ctypes.c_int)
         elif ptype == 'double':
             argtypes.append(ctypes.c_double)
-        elif ptype == 'vec':
+        elif ptype in ('vec', 'avec'):
             argtypes += [ctypes.POINTER(ctypes.c_double), ctypes.c_int]
         elif ptype == 'ivec':
             argtypes += [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        elif ptype == 'amat':
+            # data pointer, rows, cols
+            argtypes += [ctypes.POINTER(ctypes.c_double), ctypes.c_int, ctypes.c_int]
     fn.argtypes = argtypes
 
     def _call(*args):
@@ -288,13 +395,15 @@ def _make_callable(
                 call_args.append(ctypes.c_int(int(val)))
             elif ptype == 'double':
                 call_args.append(ctypes.c_double(float(val)))
-            elif ptype == 'vec':
-                # 2D numpy arrays are flattened row-major (C order) automatically
+            elif ptype in ('vec', 'avec'):
+                # 2D arrays are flattened row-major (C order)
                 arr = np.asarray(val, dtype=np.float64)
                 if arr.ndim == 2:
                     arr = np.ascontiguousarray(arr.flatten())
                 elif arr.ndim != 1:
                     raise TypeError(f"Expected 1D or 2D array, got {arr.ndim}D")
+                else:
+                    arr = np.ascontiguousarray(arr)
                 call_args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
                 call_args.append(ctypes.c_int(arr.size))
             elif ptype == 'ivec':
@@ -304,6 +413,15 @@ def _make_callable(
                 arr = np.ascontiguousarray(arr)
                 call_args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
                 call_args.append(ctypes.c_int(arr.size))
+            elif ptype == 'amat':
+                # Always send as contiguous row-major (C order); wrapper transposes
+                arr = np.asarray(val, dtype=np.float64)
+                if arr.ndim != 2:
+                    raise TypeError(f"arma::mat requires a 2D array, got {arr.ndim}D")
+                arr = np.ascontiguousarray(arr)  # ensures C order
+                call_args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+                call_args.append(ctypes.c_int(arr.shape[0]))
+                call_args.append(ctypes.c_int(arr.shape[1]))
         rc = fn(*call_args)
         if rc != 0:
             raise RuntimeError(f"Runtime error in {name!r} (code {rc})")
@@ -342,11 +460,18 @@ def cppFunction(code: str) -> 'Callable | dict[str, Callable]':
     if not funcs:
         raise ValueError(
             "No function definitions with supported types found. "
-            "Supported types: int, double, std::vector<double>."
+            "Supported types: int, double, std::vector<double>, std::vector<int>, "
+            "arma::vec, arma::mat."
         )
+    use_arma = _needs_armadillo(code, funcs)
     key = hashlib.md5((_VERSION + code.strip()).encode()).hexdigest()
     if key not in _lib_cache:
-        _load_and_cache(key, _build_source(code, funcs))
+        src = _build_source(code, funcs, use_arma=use_arma)
+        extra: list[str] = []
+        if use_arma:
+            cflags, ldflags = _find_armadillo()
+            extra = cflags + ldflags
+        _load_and_cache(key, src, extra_flags=extra)
     lib = _lib_cache[key]
     callables = {
         name: _make_callable(lib, name, ret, params)
@@ -419,6 +544,13 @@ def check() -> None:
     except RuntimeError as e:
         print(f"Compiler NOT FOUND — {e}")
         return
+
+    # Armadillo
+    try:
+        cflags, ldflags = _find_armadillo()
+        print(f"Arma     found  (flags: {' '.join(cflags + ldflags)})")
+    except RuntimeError as e:
+        print(f"Arma     NOT FOUND — {e}")
 
     # Smoke test
     try:

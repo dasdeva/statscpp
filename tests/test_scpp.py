@@ -228,6 +228,72 @@ def test_matrix_row_major_order():
 
 
 # ---------------------------------------------------------------------------
+# Armadillo — arma::vec and arma::mat
+# ---------------------------------------------------------------------------
+_ARMA_VEC_CODE = """
+arma::vec normalize(arma::vec x) {
+    return x / arma::norm(x);
+}
+"""
+
+_ARMA_MAT_CODE = """
+arma::mat mat_inv(arma::mat A) {
+    return arma::inv(A);
+}
+"""
+
+_ARMA_MIXED_CODE = """
+arma::vec mat_vec_mul(arma::mat A, arma::vec x) {
+    return A * x;
+}
+"""
+
+_ARMA_SCALAR_CODE = """
+double mat_det(arma::mat A) {
+    return arma::det(A);
+}
+"""
+
+def test_arma_vec_normalize():
+    fn = cppFunction(_ARMA_VEC_CODE)
+    import numpy as np
+    x = np.array([3.0, 4.0])
+    result = fn(x)
+    np.testing.assert_allclose(result, [0.6, 0.8])
+
+def test_arma_mat_inv():
+    fn = cppFunction(_ARMA_MAT_CODE)
+    import numpy as np
+    A = np.array([[1.0, 2.0], [3.0, 4.0]])
+    result = fn(A).reshape(2, 2)
+    np.testing.assert_allclose(result @ A, np.eye(2), atol=1e-10)
+
+def test_arma_mat_vec_mul():
+    fn = cppFunction(_ARMA_MIXED_CODE)
+    import numpy as np
+    A = np.array([[1.0, 0.0], [0.0, 2.0]])
+    x = np.array([3.0, 4.0])
+    result = fn(A, x)
+    np.testing.assert_allclose(result, [3.0, 8.0])
+
+def test_arma_det():
+    fn = cppFunction(_ARMA_SCALAR_CODE)
+    import numpy as np
+    A = np.array([[1.0, 2.0], [3.0, 4.0]])
+    result = fn(A)
+    assert abs(result[0] - np.linalg.det(A)) < 1e-10
+
+def test_arma_auto_include():
+    # arma:: in code triggers automatic #include <armadillo> injection
+    fn = cppFunction("""
+        arma::vec scale(arma::vec v, double s) { return v * s; }
+    """)
+    import numpy as np
+    result = fn(np.array([1.0, 2.0, 3.0]), 2.0)
+    np.testing.assert_allclose(result, [2.0, 4.0, 6.0])
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 def test_compilation_error():
