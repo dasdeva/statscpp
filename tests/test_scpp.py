@@ -144,6 +144,90 @@ def test_evalcpp_expression():
 
 
 # ---------------------------------------------------------------------------
+# std::vector<int>
+# ---------------------------------------------------------------------------
+_IVEC_CODE = """
+int ivec_sum(std::vector<int> x) {
+    int s = 0;
+    for (int v : x) s += v;
+    return s;
+}
+"""
+
+def test_ivec_from_list():
+    fn = cppFunction(_IVEC_CODE)
+    result = fn([1, 2, 3, 4])
+    assert result[0] == 10.0
+
+def test_ivec_from_numpy():
+    fn = cppFunction(_IVEC_CODE)
+    import numpy as np
+    result = fn(np.array([5, 6, 7], dtype=np.int32))
+    assert result[0] == 18.0
+
+
+# ---------------------------------------------------------------------------
+# 2D numpy array (matrix) input
+# ---------------------------------------------------------------------------
+_TRACE_CODE = """
+double trace(std::vector<double> mat, int rows, int cols) {
+    double s = 0.0;
+    int n = std::min(rows, cols);
+    for (int i = 0; i < n; i++) s += mat[i * cols + i];
+    return s;
+}
+"""
+
+_MATMUL_CODE = """
+std::vector<double> matmul(
+    std::vector<double> A, int Ar, int Ac,
+    std::vector<double> B, int Br, int Bc
+) {
+    if (Ac != Br) throw std::invalid_argument("inner dims mismatch");
+    std::vector<double> C(Ar * Bc, 0.0);
+    for (int i = 0; i < Ar; i++)
+        for (int k = 0; k < Ac; k++)
+            for (int j = 0; j < Bc; j++)
+                C[i * Bc + j] += A[i * Ac + k] * B[k * Bc + j];
+    return C;
+}
+"""
+
+def test_matrix_trace():
+    fn = cppFunction(_TRACE_CODE)
+    import numpy as np
+    A = np.eye(3)
+    result = fn(A, *A.shape)   # 2D array auto-flattened, shape unpacked as rows, cols
+    assert abs(result[0] - 3.0) < 1e-10
+
+def test_matrix_trace_nonsquare():
+    fn = cppFunction(_TRACE_CODE)
+    import numpy as np
+    A = np.array([[1.0, 2.0, 3.0],
+                  [4.0, 5.0, 6.0]])   # 2x3
+    result = fn(A, *A.shape)
+    assert abs(result[0] - 6.0) < 1e-10   # 1 + 5
+
+def test_matmul():
+    fn = cppFunction(_MATMUL_CODE)
+    import numpy as np
+    A = np.array([[1.0, 2.0], [3.0, 4.0]])
+    B = np.array([[5.0, 6.0], [7.0, 8.0]])
+    result = fn(A, *A.shape, B, *B.shape).reshape(2, 2)
+    expected = A @ B
+    np.testing.assert_allclose(result, expected)
+
+def test_matrix_row_major_order():
+    # Verify that C-order (row-major) flattening is used
+    fn = cppFunction(_TRACE_CODE)
+    import numpy as np
+    # Fortran-order array should still give the right trace after auto-flatten
+    A = np.asfortranarray(np.eye(4))
+    result = fn(A, *A.shape)
+    assert abs(result[0] - 4.0) < 1e-10
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 def test_compilation_error():

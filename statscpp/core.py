@@ -117,19 +117,28 @@ def _compile(src: str, lib_path: Path, src_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Type system
 # ---------------------------------------------------------------------------
-_TYPE_PAT = r'(?:(?:std::)?vector\s*<\s*double\s*>|double|float|int|long|size_t)'
+_TYPE_PAT = (
+    r'(?:'
+    r'(?:std::)?vector\s*<\s*double\s*>'
+    r'|(?:std::)?vector\s*<\s*int\s*>'
+    r'|double|float|int|long|size_t'
+    r')'
+)
 
 
 def _norm_type(t: str) -> str:
     t = re.sub(r'\s+', ' ', t.strip())
     if re.search(r'vector\s*<\s*double\s*>', t):
         return 'vec'
+    if re.search(r'vector\s*<\s*int\s*>', t):
+        return 'ivec'
     if t in ('double', 'float'):
         return 'double'
     if t in ('int', 'long', 'size_t'):
         return 'int'
     raise ValueError(
-        f"Unsupported type {t!r}. Supported: int, double, std::vector<double>."
+        f"Unsupported type {t!r}. "
+        "Supported: int, double, std::vector<double>, std::vector<int>."
     )
 
 
@@ -191,6 +200,12 @@ def _gen_wrapper(ret: str, name: str, params: list[tuple[str, str]]) -> str:
             c_params += [f'double* {pname}_data', f'int {pname}_len']
             setup.append(
                 f'std::vector<double> {pname}({pname}_data, {pname}_data + {pname}_len);'
+            )
+            call_args.append(pname)
+        elif ptype == 'ivec':
+            c_params += [f'int* {pname}_data', f'int {pname}_len']
+            setup.append(
+                f'std::vector<int> {pname}({pname}_data, {pname}_data + {pname}_len);'
             )
             call_args.append(pname)
 
@@ -260,6 +275,8 @@ def _make_callable(
             argtypes.append(ctypes.c_double)
         elif ptype == 'vec':
             argtypes += [ctypes.POINTER(ctypes.c_double), ctypes.c_int]
+        elif ptype == 'ivec':
+            argtypes += [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
     fn.argtypes = argtypes
 
     def _call(*args):
@@ -272,9 +289,21 @@ def _make_callable(
             elif ptype == 'double':
                 call_args.append(ctypes.c_double(float(val)))
             elif ptype == 'vec':
+                # 2D numpy arrays are flattened row-major (C order) automatically
                 arr = np.asarray(val, dtype=np.float64)
+                if arr.ndim == 2:
+                    arr = np.ascontiguousarray(arr.flatten())
+                elif arr.ndim != 1:
+                    raise TypeError(f"Expected 1D or 2D array, got {arr.ndim}D")
                 call_args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
-                call_args.append(ctypes.c_int(len(arr)))
+                call_args.append(ctypes.c_int(arr.size))
+            elif ptype == 'ivec':
+                arr = np.asarray(val, dtype=np.int32)
+                if arr.ndim != 1:
+                    raise TypeError(f"std::vector<int> requires a 1D array, got {arr.ndim}D")
+                arr = np.ascontiguousarray(arr)
+                call_args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+                call_args.append(ctypes.c_int(arr.size))
         rc = fn(*call_args)
         if rc != 0:
             raise RuntimeError(f"Runtime error in {name!r} (code {rc})")
