@@ -1,8 +1,34 @@
 """
 C++ source generation.
 
-Builds the full .cpp file that gets compiled: the DLL-export macro, standard
-includes, the user's code verbatim, and one extern "C" shim per function.
+The problem: Python's ctypes can only call extern "C" functions, but user
+code is written in regular C++ with templates, vectors, etc.
+
+The solution: Generate "shim" functions that wrap the user's functions.
+These shims:
+  1. Accept flattened C-style arguments (e.g., a pointer + size instead of vector)
+  2. Reconstruct high-level types (e.g., std::vector from pointer + size)
+  3. Call the user's function
+  4. Flatten the result back to C arguments
+
+Example:
+  User writes:
+    std::vector<double> rnorm(int n) { ... }
+
+  We generate a shim:
+    extern "C" int __shim_rnorm(double* __out, int* __n_out, int n) {
+        try {
+            std::vector<double> result = rnorm(n);
+            *__n_out = result.size();
+            for (int i=0; i < *__n_out; i++) __out[i] = result[i];
+            return 0;  // success
+        } catch (...) {
+            *__n_out = 0;  // signal error
+            return 1;
+        }
+    }
+
+Python then calls this shim via ctypes, extracting results into NumPy arrays.
 """
 from . import types
 

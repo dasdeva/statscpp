@@ -32,13 +32,22 @@ def find() -> tuple[str, str]:
         if path:
             return path, "msvc"
     raise RuntimeError(
-        "No C++ compiler found on PATH.\n"
-        "  macOS:   xcode-select --install\n"
-        "  Ubuntu:  sudo apt install build-essential\n"
-        "  Fedora:  sudo dnf install gcc-c++\n"
-        "  Arch:    sudo pacman -S base-devel\n"
-        "  Windows: install MinGW-w64 (winget install MSYS2.MSYS2)\n"
-        "           or Visual Studio Build Tools (includes cl.exe)"
+        "❌ No C++ compiler found on PATH.\n\n"
+        "statscpp needs a C++ compiler to turn your code into machine code.\n"
+        "Install one for your OS:\n\n"
+        "  macOS:\n"
+        "    xcode-select --install\n\n"
+        "  Ubuntu/Debian:\n"
+        "    sudo apt install build-essential\n\n"
+        "  Fedora/RHEL:\n"
+        "    sudo dnf install gcc-c++\n\n"
+        "  Arch:\n"
+        "    sudo pacman -S base-devel\n\n"
+        "  Windows:\n"
+        "    Option 1: Install MinGW-w64\n"
+        "      winget install MSYS2.MSYS2\n\n"
+        "    Option 2: Install Visual Studio Build Tools\n"
+        "      (includes cl.exe compiler)"
     )
 
 
@@ -81,4 +90,8 @@ def compile(
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(lib_path.parent))
     if result.returncode != 0:
         stderr = result.stderr.strip() or result.stdout.strip()
-        raise CompilationError(f"Compilation failed:\n\n{stderr}")
+        raise CompilationError(
+            f"❌ C++ compiler error. Your code has a syntax or type error:\n\n{stderr}\n\n"
+            f"Generated C++ source saved at: {src_path}\n"
+            f"You can inspect this file to debug the issue."
+        )

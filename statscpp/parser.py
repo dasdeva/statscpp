@@ -1,8 +1,23 @@
 """
 C++ function signature parser.
 
-Extracts function definitions from user-supplied code strings so the rest of
-the pipeline knows what extern "C" wrappers to generate.
+Why this exists:
+  The user writes C++ code with functions like:
+    std::vector<double> rnorm(int n, double mean) { ... }
+
+  To call this from Python, we need to know:
+    - What does it return? (std::vector<double> → tag "vec")
+    - What's its name? (rnorm)
+    - What parameters? (int n, double mean → tags "int", "double")
+
+  This parser extracts that info using regex, then passes it down the
+  pipeline so the code generator can create a wrapper function.
+
+Why regex and not a full C++ parser?
+  - We only need signature info, not a full parse tree
+  - Regex is fast and simple for common cases
+  - We skip functions with unsupported types silently (so helper
+    functions with internal types don't break everything)
 """
 import re
 from . import types
@@ -31,7 +46,14 @@ def parse_params(raw: str) -> list[tuple[str, str]]:
         chunk = re.sub(r'\s*=\s*[^,]+$', '', chunk)   # drop default value
         m = re.match(rf'({types.PATTERN})\s+(\w+)', chunk)
         if not m:
-            raise ValueError(f"Cannot parse parameter: {chunk!r}")
+            raise ValueError(
+                f"❌ Could not parse parameter: {chunk!r}\n\n"
+                f"Expected format: <type> <name>\n"
+                f"Example: std::vector<double> values\n"
+                f"Example: int n\n\n"
+                f"Supported types: int, double, std::vector<double>, "
+                f"std::vector<int>, arma::vec, arma::mat"
+            )
         result.append((types.normalize(m.group(1)), m.group(2)))
     return result
 

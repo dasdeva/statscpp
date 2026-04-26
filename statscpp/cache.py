@@ -1,9 +1,26 @@
 """
-Compile-once cache.
+Compile-once cache for performance.
 
-Compiled shared libraries are stored in ~/.cache/statscpp/ keyed by the
-MD5 hash of (package_version + source_code).  This makes the cache
-version-aware: upgrading statscpp automatically invalidates old .so files.
+The big idea: Compilation is slow. Once we've compiled a function,
+we should reuse it without recompiling if the code hasn't changed.
+
+How it works:
+  1. User calls cppFunction(code)
+  2. We hash (package_version + code) to get a unique key
+  3. Check ~/.cache/statscpp/ for a compiled .so/.dll/.dylib with that key
+  4. If found: load it and use it (instant!)
+  5. If not found: compile it, save to cache, then use it
+
+Why include the version?
+  If statscpp upgrades, the wrapper code changes, so old compiled files
+  become stale. By including version in the hash, we automatically
+  invalidate cached files after upgrades.
+
+Two-level cache:
+  - Disk cache: Survives between Python sessions in ~/.cache/statscpp/
+  - In-process cache (_libs dict): Survives within the same Python session
+  
+  The in-process cache is much faster (no disk I/O).
 """
 import ctypes
 import hashlib

@@ -1,16 +1,27 @@
 """
-Python ↔ C type marshaling.
+Python ↔ C type marshaling (data conversion).
 
-Converts Python / numpy values into the flat C arguments expected by the
-generated extern "C" shims, and wraps a compiled shim in a Python callable
-that returns numpy arrays.
+Why this exists:
+  When you call a wrapped C++ function from Python, several things must happen:
+  1. Convert Python/NumPy values to ctypes (the C layer)
+  2. Pass them to the compiled C shim
+  3. Convert results back to NumPy arrays
 
-Memory-safety note
-------------------
-For array parameters, ``_to_c`` returns both the ctypes objects *and* the
-underlying numpy array.  The caller must keep the numpy array alive until
-after the C function returns; storing it in a ``refs`` list inside ``_call``
-achieves this without relying on CPython's reference-counting timing.
+Example:
+  Python user calls:
+    result = rnorm(n=10, mean=0.0, sd=1.0)
+
+  Internally we must:
+    - Convert n (int) to ctypes.c_int
+    - Convert mean (float) to ctypes.c_double
+    - Convert sd (float) to ctypes.c_double
+    - Call the C shim with these values
+    - Extract the output buffer (a C array) and convert to np.ndarray
+
+Memory-safety note:
+  For arrays, we keep references to NumPy arrays until after the C call
+  completes. This prevents Python from garbage-collecting the memory while
+  C code is still using it.
 """
 import ctypes
 from typing import Callable
